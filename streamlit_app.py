@@ -63,16 +63,21 @@ class Block(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12):
         super().__init__()
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_size = patch_size
+        self.patch_embed = nn.Linear(patch_size * patch_size * in_chans, embed_dim)
         num_patches = (img_size // patch_size) ** 2
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.blocks = nn.ModuleList([Block(embed_dim, num_heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(embed_dim)
         
     def forward(self, x):
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        # Patchify and embed
+        x = patchify(x, self.patch_size)  # B, num_patches, patch_dim
+        x = self.patch_embed(x)
         x = x + self.pos_embed
         for block in self.blocks:
             x = block(x)
+        x = self.norm(x)
         return x
 
 class Decoder(nn.Module):
