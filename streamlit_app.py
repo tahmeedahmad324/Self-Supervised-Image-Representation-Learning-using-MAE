@@ -1,5 +1,6 @@
 import streamlit as st
 import torch
+import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 import numpy as np
@@ -9,6 +10,106 @@ st.set_page_config(page_title="MAE Reconstruction", layout="wide")
 IMG_SIZE = 224
 PATCH_SIZE = 16
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Model Architecture
+class MAE(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3,
+                 embed_dim=768, depth=12, num_heads=12,
+                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, mask_ratio=0.75):
+        super().__init__()
+        
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.mask_ratio = mask_ratio
+        
+        # Patch embedding
+        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        # Positional embeddings
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        
+        # Encoder
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=int(embed_dim * mlp_ratio),
+                dropout=0.0,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True
+            ),
+            num_layers=depth,
+            norm=norm_layer(embed_dim)
+        )
+        
+        # Decoder
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_embed_dim))
+        
+        self.decoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=decoder_embed_dim,
+                nhead=decoder_num_heads,
+                dim_feedforward=int(decoder_embed_dim * mlp_ratio),
+                dropout=0.0,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True
+            ),
+            num_layers=decoder_depth,
+            norm=norm_layer(decoder_embed_dim)
+        )
+        
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans)
+        
+    def random_masking(self, x, mask_ratio):
+        B, N, D = x.shape
+        len_keep = int(N * (1 - mask_ratio))
+        
+        noise = torch.rand(B, N, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        
+        mask = torch.ones([B, N], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        
+        return x_masked, mask, ids_restore
+    
+    def forward(self, imgs):
+        # Patch embedding
+        x = self.patch_embed(imgs)
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_embed
+        
+        # Target for reconstruction
+        target = patchify(imgs, self.patch_size)
+        
+        # Masking
+        x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
+        
+        # Encoder
+        x = self.encoder(x)
+        
+        # Decoder
+        x = self.decoder_embed(x)
+        
+        # Append mask tokens
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
+        x = torch.cat([x, mask_tokens], dim=1)
+        x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        x = x + self.decoder_pos_embed
+        
+        x = self.decoder(x)
+        x = self.decoder_pred(x)
+        
+        return x, mask, target
 
 # Utility functions (lightweight, needed for preprocessing)
 def patchify(images, patch_size):
@@ -31,15 +132,33 @@ def unpatchify(patches, patch_size, img_size):
 
 @st.cache_resource
 def load_model():
-    """Load the complete trained model"""
+    """Load the trained model"""
     try:
-        # Load complete model (saved with torch.save(model, ...))
-        model = torch.load('mae_best_model.pth', map_location=device)
+        # Initialize model architecture
+        model = MAE(
+            img_size=224,
+            patch_size=16,
+            in_chans=3,
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            decoder_embed_dim=512,
+            decoder_depth=8,
+            decoder_num_heads=16,
+            mask_ratio=0.75
+        ).to(device)
+        
+        # Load state dict
+        state_dict = torch.load('mae_best_model.pth', map_location=device)
+        model.load_state_dict(state_dict)
         model.eval()
         return model
     except FileNotFoundError:
         st.error("❌ Model file 'mae_best_model.pth' not found!")
-        st.info("Make sure you've saved the best model in Kaggle using: torch.save(model, 'mae_best_model.pth')")
+        st.info("Make sure you've saved the best model in Kaggle using: torch.save(model.state_dict(), 'mae_best_model.pth')")
+        st.stop()
+    except Exception as e:
+        st.error(f"❌ Error loading model: {str(e)}")
         st.stop()
 
 model = load_model()
