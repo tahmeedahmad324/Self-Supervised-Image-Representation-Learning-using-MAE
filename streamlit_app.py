@@ -11,105 +11,122 @@ IMG_SIZE = 224
 PATCH_SIZE = 16
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Model Architecture
-class MAE(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3,
-                 embed_dim=768, depth=12, num_heads=12,
-                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, mask_ratio=0.75):
+# Model Architecture (matching training code structure)
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
         
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        B, N, C = x.shape
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.out_proj(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.act = nn.GELU()
+        
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, int(dim * mlp_ratio))
+        
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12):
+        super().__init__()
+        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (img_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.blocks = nn.ModuleList([Block(embed_dim, num_heads) for _ in range(depth)])
+        
+    def forward(self, x):
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        x = x + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, num_patches, encoder_dim=768, decoder_dim=384, depth=8, num_heads=16, patch_size=16):
+        super().__init__()
+        self.decoder_embed = nn.Linear(encoder_dim, decoder_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_dim))
+        self.blocks = nn.ModuleList([Block(decoder_dim, num_heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(decoder_dim)
+        self.pred = nn.Linear(decoder_dim, patch_size**2 * 3)
+        
+    def forward(self, x, ids_restore):
+        x = self.decoder_embed(x)
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
+        x = torch.cat([x, mask_tokens], dim=1)
+        x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        x = x + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        x = self.pred(x)
+        return x
+
+class MAE(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12,
+                 decoder_dim=384, decoder_depth=8, decoder_num_heads=16, mask_ratio=0.75):
+        super().__init__()
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
         self.mask_ratio = mask_ratio
         
-        # Patch embedding
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        
-        # Positional embeddings
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-        
-        # Encoder
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=int(embed_dim * mlp_ratio),
-                dropout=0.0,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True
-            ),
-            num_layers=depth,
-            norm=norm_layer(embed_dim)
-        )
-        
-        # Decoder
-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_embed_dim))
-        
-        self.decoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=decoder_embed_dim,
-                nhead=decoder_num_heads,
-                dim_feedforward=int(decoder_embed_dim * mlp_ratio),
-                dropout=0.0,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True
-            ),
-            num_layers=decoder_depth,
-            norm=norm_layer(decoder_embed_dim)
-        )
-        
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans)
+        self.encoder = Encoder(img_size, patch_size, in_chans, embed_dim, depth, num_heads)
+        self.decoder = Decoder(self.num_patches, embed_dim, decoder_dim, decoder_depth, decoder_num_heads, patch_size)
         
     def random_masking(self, x, mask_ratio):
         B, N, D = x.shape
         len_keep = int(N * (1 - mask_ratio))
-        
         noise = torch.rand(B, N, device=x.device)
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
-        
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        
         mask = torch.ones([B, N], device=x.device)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
-        
         return x_masked, mask, ids_restore
     
     def forward(self, imgs):
-        # Patch embedding
-        x = self.patch_embed(imgs)
-        x = x.flatten(2).transpose(1, 2)
-        x = x + self.pos_embed
-        
-        # Target for reconstruction
         target = patchify(imgs, self.patch_size)
-        
-        # Masking
+        x = self.encoder(imgs)
         x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
-        
-        # Encoder
-        x = self.encoder(x)
-        
-        # Decoder
-        x = self.decoder_embed(x)
-        
-        # Append mask tokens
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
-        x = torch.cat([x, mask_tokens], dim=1)
-        x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
-        x = x + self.decoder_pos_embed
-        
-        x = self.decoder(x)
-        x = self.decoder_pred(x)
-        
-        return x, mask, target
+        pred = self.decoder(x, ids_restore)
+        return pred, mask, target
 
 # Utility functions (lightweight, needed for preprocessing)
 def patchify(images, patch_size):
@@ -134,7 +151,7 @@ def unpatchify(patches, patch_size, img_size):
 def load_model():
     """Load the trained model"""
     try:
-        # Initialize model architecture
+        # Initialize model architecture (matching training configuration)
         model = MAE(
             img_size=224,
             patch_size=16,
@@ -142,7 +159,7 @@ def load_model():
             embed_dim=768,
             depth=12,
             num_heads=12,
-            decoder_embed_dim=512,
+            decoder_dim=384,  # Corrected decoder dimension
             decoder_depth=8,
             decoder_num_heads=16,
             mask_ratio=0.75
