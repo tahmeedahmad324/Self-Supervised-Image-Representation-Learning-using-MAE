@@ -34,12 +34,12 @@ def load_model():
     """Load the complete trained model"""
     try:
         # Load complete model (saved with torch.save(model, ...))
-        model = torch.load('mae_complete_model.pth', map_location=device)
+        model = torch.load('mae_best_model.pth', map_location=device)
         model.eval()
         return model
     except FileNotFoundError:
-        st.error("❌ Model file 'mae_complete_model.pth' not found!")
-        st.info("Make sure you've saved the complete model in Kaggle using: torch.save(model, 'mae_complete_model.pth')")
+        st.error("❌ Model file 'mae_best_model.pth' not found!")
+        st.info("Make sure you've saved the best model in Kaggle using: torch.save(model, 'mae_best_model.pth')")
         st.stop()
 
 model = load_model()
